@@ -1173,6 +1173,25 @@ class EachTest < ActiveRecord::TestCase
     assert_equal books, walked
   end
 
+  test "batching visits every composite cursor once in each direction" do
+    insert_cpk_books([1, 1], [1, 2], [2, 1], [2, 2])
+
+    [[:asc, :asc], [:asc, :desc], [:desc, :asc], [:desc, :desc]].each do |order|
+      expected = Cpk::Book.order(author_id: order.first, id: order.last).map(&:id)
+      assert_equal expected, Cpk::Book.find_each(batch_size: 1, order: order).map(&:id)
+    end
+  end
+
+  test "batching defaults unspecified composite cursor directions to ascending" do
+    insert_cpk_books([1, 1], [1, 2], [2, 1], [2, 2])
+    expected = [[2, 1], [2, 2], [1, 1], [1, 2]]
+
+    [Cpk::Book.all, Cpk::Book.all.load].each do |scope|
+      assert_equal expected, scope.find_each(batch_size: 1, order: [:desc]).map(&:id)
+      assert_equal expected[1..2], scope.find_each(batch_size: 1, order: [:desc], start: [2, 2], finish: [1, 1]).map(&:id)
+    end
+  end
+
   test ".in_batches over several columns compares row values from the start option and in descending order" do
     skip unless Cpk::Book.with_connection(&:supports_row_value_comparison?)
 

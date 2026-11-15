@@ -93,8 +93,8 @@ module ActiveRecord
         enum_for(:find_each, start: start, finish: finish, batch_size: batch_size, error_on_ignore: error_on_ignore, cursor: cursor, order: order) do
           relation = self
           cursor = Array(cursor)
-          batch_orders = build_batch_orders(cursor, order)
-          apply_limits(relation, start, finish, batch_orders, build_batch_predicate(batch_orders)).size
+          batch_directions = build_batch_directions(cursor, order)
+          apply_limits(relation, start, finish, batch_directions, build_batch_predicate(cursor, batch_directions)).size
         end
       end
     end
@@ -166,8 +166,8 @@ module ActiveRecord
       unless block_given?
         return to_enum(:find_in_batches, start: start, finish: finish, batch_size: batch_size, error_on_ignore: error_on_ignore, cursor: cursor, order: order) do
           cursor = Array(cursor)
-          batch_orders = build_batch_orders(cursor, order)
-          total = apply_limits(relation, start, finish, batch_orders, build_batch_predicate(batch_orders)).size
+          batch_directions = build_batch_directions(cursor, order)
+          total = apply_limits(relation, start, finish, batch_directions, build_batch_predicate(cursor, batch_directions)).size
           (total - 1).div(batch_size) + 1
         end
       end
@@ -331,21 +331,21 @@ module ActiveRecord
         end
       end
 
-      def apply_limits(relation, start, finish, batch_orders, batch_predicate)
-        relation = apply_start_limit(relation, start, batch_orders, batch_predicate) if start
-        relation = apply_finish_limit(relation, finish, batch_orders, batch_predicate) if finish
+      def apply_limits(relation, start, finish, batch_directions, batch_predicate)
+        relation = apply_start_limit(relation, start, batch_directions, batch_predicate) if start
+        relation = apply_finish_limit(relation, finish, batch_directions, batch_predicate) if finish
         relation
       end
 
-      def apply_start_limit(relation, start, batch_orders, batch_predicate)
-        operators = batch_orders.map do |_column, order|
+      def apply_start_limit(relation, start, batch_directions, batch_predicate)
+        operators = batch_directions.map do |order|
           order == :desc ? :lteq : :gteq
         end
         relation.where(batch_predicate.call(start, operators))
       end
 
-      def apply_finish_limit(relation, finish, batch_orders, batch_predicate)
-        operators = batch_orders.map do |_column, order|
+      def apply_finish_limit(relation, finish, batch_directions, batch_predicate)
+        operators = batch_directions.map do |order|
           order == :desc ? :gteq : :lteq
         end
         relation.where(batch_predicate.call(finish, operators))
@@ -353,10 +353,9 @@ module ActiveRecord
 
       # Only for speed: (a, b) > (x, y) selects the same rows as a > x OR (a = x AND b > y),
       # but PostgreSQL and SQLite read an index on (a, b) from (x, y) instead of from its start.
-      def build_batch_predicate(batch_orders)
-        cursor = batch_orders.map(&:first)
-        cursor_single_column = batch_orders.size == 1
-        mixed_orders = batch_orders.uniq(&:last).size > 1
+      def build_batch_predicate(cursor, batch_directions)
+        cursor_single_column = cursor.size == 1
+        mixed_orders = batch_directions.uniq.size > 1
         if cursor_single_column || mixed_orders
           return ->(values, operators) { column_batch_condition(cursor, values, operators) }
         end
@@ -407,10 +406,20 @@ module ActiveRecord
         condition
       end
 
-      def build_batch_orders(cursor, order)
-        cursor.zip(Array(order)).map do |column, order_|
-          [column, order_ || DEFAULT_ORDER]
+      def build_batch_directions(cursor, order)
+        orders = Array(order)
+        cursor.each_index.map do |index|
+          orders[index] || DEFAULT_ORDER
         end
+      end
+
+      # Build operators for the next batch: the last column uses a strict
+      # comparison to exclude the current cursor, while earlier columns use
+      # inclusive comparisons so later columns can advance when they are equal.
+      def build_batch_continuation_operators(directions)
+        operators = directions.map { |direction| direction == :desc ? :lteq : :gteq }
+        operators.pop
+        operators << (directions.last == :desc ? :lt : :gt)
       end
 
       def act_on_ignored_order(error_on_ignore)
@@ -425,7 +434,7 @@ module ActiveRecord
 
       def batch_on_loaded_relation(relation:, start:, finish:, cursor:, order:, batch_limit:)
         records = relation.to_a
-        order = build_batch_orders(cursor, order).map(&:second)
+        order = build_batch_directions(cursor, order)
 
         if start || finish
           records = records.filter do |record|
@@ -471,13 +480,14 @@ module ActiveRecord
       end
 
       def batch_on_unloaded_relation(relation:, start:, finish:, load:, cursor:, order:, use_ranges:, remaining:, batch_limit:)
-        batch_orders = build_batch_orders(cursor, order)
-        batch_predicate = build_batch_predicate(batch_orders)
-        relation = relation.reorder(batch_orders.to_h).limit(batch_limit)
-        relation = apply_limits(relation, start, finish, batch_orders, batch_predicate)
+        batch_directions = build_batch_directions(cursor, order)
+        batch_predicate = build_batch_predicate(cursor, batch_directions)
+        relation = relation.reorder(cursor.zip(batch_directions).to_h).limit(batch_limit)
+        relation = apply_limits(relation, start, finish, batch_directions, batch_predicate)
         relation.skip_query_cache! # Retaining the results in the query cache would undermine the point of batching
         batch_relation = relation
         empty_scope = to_sql == model.unscoped.all.to_sql
+        operators = build_batch_continuation_operators(batch_directions)
 
         loop do
           if load
@@ -502,7 +512,7 @@ module ActiveRecord
 
             # Finally, build the yielded relation if at least one value found.
             if values_last
-              yielded_relation = apply_finish_limit(batch_relation, values_last, batch_orders, batch_predicate)
+              yielded_relation = apply_finish_limit(batch_relation, values_last, batch_directions, batch_predicate)
               yielded_relation = yielded_relation.except(:limit, :order, :default_order)
               yielded_relation.skip_query_cache!(false)
             end
@@ -535,13 +545,6 @@ module ActiveRecord
               relation = relation.limit(remaining)
             end
           end
-
-          batch_orders_copy = batch_orders.dup
-          _last_column, last_order = batch_orders_copy.pop
-          operators = batch_orders_copy.map do |_column, order|
-            order == :desc ? :lteq : :gteq
-          end
-          operators << (last_order == :desc ? :lt : :gt)
 
           cursor_value = values_last
           batch_relation = relation.where(batch_predicate.call(cursor_value, operators))
