@@ -479,6 +479,15 @@ class EachTest < ActiveRecord::TestCase
     end
   end
 
+  def test_in_batches_loads_records_when_ranges_are_requested
+    batch_count = 0
+    Post.in_batches(of: 2, load: true, use_ranges: true) do |batch|
+      assert_predicate batch, :loaded?
+      batch_count += 1
+    end
+    assert_operator batch_count, :>, 0
+  end
+
   def test_in_batches_if_not_loaded_executes_more_queries
     assert_queries_count(@total + 2) do
       Post.in_batches(of: 1, load: false) do |relation|
