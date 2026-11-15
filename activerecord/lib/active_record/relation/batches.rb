@@ -479,6 +479,12 @@ module ActiveRecord
         0
       end
 
+      def build_range_batch_relation(batch_relation, values_last, batch_directions, batch_predicate)
+        yielded_relation = apply_finish_limit(batch_relation, values_last, batch_directions, batch_predicate)
+        yielded_relation = yielded_relation.except(:limit, :order, :default_order)
+        yielded_relation.skip_query_cache!(false)
+      end
+
       def batch_on_unloaded_relation(relation:, start:, finish:, load:, cursor:, order:, use_ranges:, remaining:, batch_limit:)
         batch_directions = build_batch_directions(cursor, order)
         batch_predicate = build_batch_predicate(cursor, batch_directions)
@@ -488,39 +494,28 @@ module ActiveRecord
         batch_relation = relation
         empty_scope = to_sql == model.unscoped.all.to_sql
         operators = build_batch_continuation_operators(batch_directions)
+        use_ranges = !load && ((empty_scope && use_ranges != false) || use_ranges)
 
         loop do
-          if load
-            records = batch_relation.records
-            values = records.pluck(*cursor)
-            values_size = values.size
-            values_last = values.last
-            yielded_relation = rewhere(cursor => values)
-            yielded_relation.load_records(records)
-          elsif (empty_scope && use_ranges != false) || use_ranges
-            # Efficiently peak at the last value for the next batch using offset and limit.
+          if use_ranges
+            # Peek at the last cursor value, or fetch the final partial batch.
             values_size = remaining ? [batch_limit, remaining].min : batch_limit
             values_last = batch_relation.offset(values_size - 1).pick(*cursor)
 
-            # If the last value is not found using offset, there is at most one more batch of size < batch_limit.
-            # Retry by getting the whole list of remaining values so that we have the exact size and last value.
             unless values_last
               values = batch_relation.pluck(*cursor)
               values_size = values.size
               values_last = values.last
             end
 
-            # Finally, build the yielded relation if at least one value found.
-            if values_last
-              yielded_relation = apply_finish_limit(batch_relation, values_last, batch_directions, batch_predicate)
-              yielded_relation = yielded_relation.except(:limit, :order, :default_order)
-              yielded_relation.skip_query_cache!(false)
-            end
+            yielded_relation = build_range_batch_relation(batch_relation, values_last, batch_directions, batch_predicate) if values_last
           else
-            values = batch_relation.pluck(*cursor)
+            records = batch_relation.records if load
+            values = load ? records.pluck(*cursor) : batch_relation.pluck(*cursor)
             values_size = values.size
             values_last = values.last
             yielded_relation = rewhere(cursor => values)
+            yielded_relation.load_records(records) if load
           end
 
           break if values_size == 0
