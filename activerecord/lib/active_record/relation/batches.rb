@@ -513,12 +513,8 @@ module ActiveRecord
             # Finally, build the yielded relation if at least one value found.
             yielded_relation = build_range_batch_relation(batch_relation, values_last, batch_directions, batch_predicate) if values_last
           else
-            if load
-              records = batch_relation.records
-              values = records.pluck(*cursor)
-            else
-              values = batch_relation.pluck(*cursor)
-            end
+            records = batch_relation.records if load
+            values = load ? records.pluck(*cursor) : batch_relation.pluck(*cursor)
             values_size = values.size
             values_last = values.last
             yielded_relation = rewhere(cursor => values)
