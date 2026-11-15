@@ -498,20 +498,27 @@ module ActiveRecord
 
         loop do
           if use_ranges
-            # Peek at the last cursor value, or fetch the final partial batch.
+            # Efficiently peek at the last value for the next batch using offset and limit.
             values_size = remaining ? [batch_limit, remaining].min : batch_limit
             values_last = batch_relation.offset(values_size - 1).pick(*cursor)
 
+            # If the last value is not found using offset, there is at most one more batch of size < batch_limit.
+            # Retry by getting the whole list of remaining values so that we have the exact size and last value.
             unless values_last
               values = batch_relation.pluck(*cursor)
               values_size = values.size
               values_last = values.last
             end
 
+            # Finally, build the yielded relation if at least one value found.
             yielded_relation = build_range_batch_relation(batch_relation, values_last, batch_directions, batch_predicate) if values_last
           else
-            records = batch_relation.records if load
-            values = load ? records.pluck(*cursor) : batch_relation.pluck(*cursor)
+            if load
+              records = batch_relation.records
+              values = records.pluck(*cursor)
+            else
+              values = batch_relation.pluck(*cursor)
+            end
             values_size = values.size
             values_last = values.last
             yielded_relation = rewhere(cursor => values)
